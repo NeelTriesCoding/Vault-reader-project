@@ -6,7 +6,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import androidx.room.Room
 import com.example.data.AppDatabase
 import com.example.data.VaultRepository
 import com.example.ui.VaultApp
@@ -16,16 +15,10 @@ import com.example.ui.theme.MyApplicationTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        // Initialize Room Database
-        val database = Room.databaseBuilder(
-            applicationContext,
-            AppDatabase::class.java,
-            "vault_database"
-        )
-        .fallbackToDestructiveMigration()
-        .build()
-        
+
+        // Room database with explicit, non-destructive migrations (see AppDatabase).
+        val database = AppDatabase.getInstance(applicationContext)
+
         val repository = VaultRepository(database)
         
         // Instantiate the ViewModel

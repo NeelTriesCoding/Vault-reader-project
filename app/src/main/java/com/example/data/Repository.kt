@@ -26,6 +26,10 @@ class VaultRepository(private val db: AppDatabase) {
         noteDao.updateNoteTags(id, converters.fromList(tags))
     }
 
+    suspend fun updateNotePosition(id: Long, posX: Float, posY: Float) {
+        noteDao.updateNotePosition(id, posX, posY)
+    }
+
     suspend fun deleteNoteById(id: Long) {
         noteDao.deleteNoteById(id)
     }
@@ -44,6 +48,10 @@ class VaultRepository(private val db: AppDatabase) {
 
     suspend fun updateLastPosition(id: Long, position: Int) {
         bookDao.updateLastPosition(id, position)
+    }
+
+    suspend fun updateTotalPages(id: Long, totalPages: Int) {
+        bookDao.updateTotalPages(id, totalPages)
     }
 
     suspend fun updateShelves(id: Long, shelves: List<String>) {
@@ -77,6 +85,10 @@ class VaultRepository(private val db: AppDatabase) {
 
     suspend fun deleteSpecificHighlight(bookId: Long, pageIndex: Int, sentenceText: String) {
         highlightDao.deleteSpecificHighlight(bookId, pageIndex, sentenceText)
+    }
+
+    suspend fun deleteHighlightAtIndex(bookId: Long, pageIndex: Int, sentenceIndex: Int) {
+        highlightDao.deleteHighlightAtIndex(bookId, pageIndex, sentenceIndex)
     }
 
     suspend fun deleteHighlightById(id: Long) {

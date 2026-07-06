@@ -3,23 +3,19 @@ package com.example.ui
 import android.app.Application
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.pdf.PdfRenderer
 import android.net.Uri
-import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.api.Content
-import com.example.api.GenerateContentRequest
-import com.example.api.GenerationConfig
-import com.example.api.GeminiClient
-import com.example.api.Part
+import com.example.api.AiEnrichmentService
 import com.example.data.Book
-import com.example.data.Converters
 import com.example.data.Link
 import com.example.data.Note
 import com.example.data.Highlight
+import com.example.data.SecureKeyStore
 import com.example.data.VaultRepository
+import com.example.data.parsing.BookParser
+import com.example.ui.map.MapLayoutEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -29,14 +25,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.BufferedReader
 import java.io.File
-import java.io.FileInputStream
-import java.io.InputStreamReader
-import java.util.zip.ZipFile
-import kotlin.math.cos
-import kotlin.math.sin
+import kotlin.math.roundToInt
 
 class VaultViewModel(
     application: Application,
@@ -45,8 +35,11 @@ class VaultViewModel(
 
     private val context = application.applicationContext
     private val prefs = context.getSharedPreferences("vault_prefs", Context.MODE_PRIVATE)
+    private val secureKeyStore = SecureKeyStore(context)
+    private val aiService = AiEnrichmentService()
 
     init {
+        migrateLegacyApiKey()
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val existingBooks = repository.allBooks.first()
@@ -59,13 +52,28 @@ class VaultViewModel(
         }
     }
 
-    // --- Gemini API Key ---
-    private val _apiKey = MutableStateFlow(prefs.getString("gemini_api_key", "") ?: "")
+    // --- Gemini API Key (encrypted at rest via SecureKeyStore) ---
+    private val _apiKey = MutableStateFlow(secureKeyStore.getApiKey())
     val apiKey: StateFlow<String> = _apiKey.asStateFlow()
 
     fun saveApiKey(key: String) {
-        prefs.edit().putString("gemini_api_key", key).apply()
+        secureKeyStore.setApiKey(key)
         _apiKey.value = key
+    }
+
+    /**
+     * One-time migration: earlier builds stored the key in plaintext under
+     * "gemini_api_key" in the regular prefs. Move it into the encrypted store
+     * and scrub the plaintext copy so keys aren't left readable on disk.
+     */
+    private fun migrateLegacyApiKey() {
+        val legacyKey = prefs.getString("gemini_api_key", null)
+        if (!legacyKey.isNullOrEmpty()) {
+            if (secureKeyStore.getApiKey().isEmpty()) {
+                secureKeyStore.setApiKey(legacyKey)
+            }
+            prefs.edit().remove("gemini_api_key").apply()
+        }
     }
 
     // --- State: Database Flows ---
@@ -106,6 +114,10 @@ class VaultViewModel(
     private val _readerPages = MutableStateFlow<List<String>>(emptyList())
     val readerPages: StateFlow<List<String>> = _readerPages.asStateFlow()
 
+    // Cached full text of the open text book, so changing font re-paginates from
+    // memory instead of re-reading the file. Null for PDFs / when no book is open.
+    private var currentBookRawText: String? = null
+
     private val _readerPageCount = MutableStateFlow(0)
     val readerPageCount: StateFlow<Int> = _readerPageCount.asStateFlow()
 
@@ -118,9 +130,10 @@ class VaultViewModel(
     private val _fontSize = MutableStateFlow(prefs.getFloat("font_size", 18f))
     val fontSize: StateFlow<Float> = _fontSize.asStateFlow()
 
-    // Cache of rendered PDF pages for speed
+    // Bounded LRU cache of rendered PDF pages for speed (see loadPdfBitmap).
     private val _pdfBitmaps = MutableStateFlow<Map<Int, Bitmap>>(emptyMap())
     val pdfBitmaps: StateFlow<Map<Int, Bitmap>> = _pdfBitmaps.asStateFlow()
+    private val MAX_CACHED_PDF_PAGES = 4
 
     fun setReadingTheme(theme: String) {
         prefs.edit().putString("reading_theme", theme).apply()
@@ -130,6 +143,26 @@ class VaultViewModel(
     fun setFontSize(size: Float) {
         prefs.edit().putFloat("font_size", size).apply()
         _fontSize.value = size
+        repaginateCurrentTextBook()
+    }
+
+    /**
+     * Re-chunks the open text book for the current font, preserving reading
+     * position proportionally. No-op for PDFs (page count is fixed) or when no
+     * text book is open. Cheap: re-chunks cached text, no file I/O.
+     */
+    private fun repaginateCurrentTextBook() {
+        val raw = currentBookRawText ?: return
+        val oldCount = _readerPageCount.value
+        val oldIndex = _currentPageIndex.value
+        val fraction = if (oldCount > 1) oldIndex.toFloat() / (oldCount - 1) else 0f
+
+        val pages = BookParser.paginate(raw, charsPerPageFor(_fontSize.value))
+        _readerPages.value = pages
+        _readerPageCount.value = pages.size
+        _currentPageIndex.value = if (pages.size > 1) {
+            (fraction * (pages.size - 1)).roundToInt().coerceIn(0, pages.size - 1)
+        } else 0
     }
 
     // --- Visual Map Zoom & Pan State ---
@@ -161,22 +194,7 @@ class VaultViewModel(
                 return@launch
             }
 
-            try {
-                val response = GeminiClient.service.generateContent(
-                    apiKey = key,
-                    request = GenerateContentRequest(
-                        contents = listOf(Content(parts = listOf(Part(text = "Hello! Answer in exactly one word."))))
-                    )
-                )
-                val text = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
-                if (text != null) {
-                    _testConnectionResult.value = Pair(true, "Connection Successful! Response: $text")
-                } else {
-                    _testConnectionResult.value = Pair(false, "Received empty response from Gemini API.")
-                }
-            } catch (e: Exception) {
-                _testConnectionResult.value = Pair(false, "Connection Failed: ${e.localizedMessage ?: e.message}")
-            }
+            _testConnectionResult.value = aiService.testConnection(key)
         }
     }
 
@@ -230,30 +248,39 @@ class VaultViewModel(
         _pdfBitmaps.value = emptyMap() // Clear old PDF cache
 
         viewModelScope.launch(Dispatchers.IO) {
-            val ext = book.filePath.substringAfterLast(".").lowercase()
-            when (ext) {
-                "pdf" -> {
-                    val count = getPdfPageCount(book.filePath)
-                    _readerPageCount.value = count
-                    _readerPages.value = List(count) { "Page ${it + 1}" }
-                    loadPdfBitmap(book.filePath, book.lastPosition)
-                }
-                "epub" -> {
-                    val epubPages = parseEpubText(book.filePath)
-                    _readerPages.value = epubPages
-                    _readerPageCount.value = epubPages.size
-                }
-                "mobi" -> {
-                    val mobiPages = parseMobiText(book.filePath)
-                    _readerPages.value = mobiPages
-                    _readerPageCount.value = mobiPages.size
-                }
-                else -> { // Default TXT file
-                    val txtPages = parseTxtText(book.filePath)
-                    _readerPages.value = txtPages
-                    _readerPageCount.value = txtPages.size
-                }
+            if (BookParser.isPdf(book.filePath)) {
+                currentBookRawText = null
+                val count = BookParser.getPdfPageCount(book.filePath)
+                _readerPageCount.value = count
+                _readerPages.value = List(count) { "Page ${it + 1}" }
+                loadPdfBitmap(book.filePath, book.lastPosition)
+            } else {
+                val raw = BookParser.extractText(book.filePath)
+                currentBookRawText = raw
+                val pages = BookParser.paginate(raw, charsPerPageFor(_fontSize.value))
+                _readerPages.value = pages
+                _readerPageCount.value = pages.size
             }
+            persistTotalPagesIfNeeded(book, _readerPageCount.value)
+        }
+    }
+
+    /**
+     * Larger reading fonts fit fewer characters per page, so page chunks shrink as
+     * the font grows. Glyph area scales with the square of the font size, so chars
+     * per page scales with (baseline / fontSize)^2. 18sp is the baseline.
+     */
+    private fun charsPerPageFor(fontSize: Float): Int {
+        val scale = 18f / fontSize.coerceAtLeast(1f)
+        return (BookParser.DEFAULT_CHARS_PER_PAGE * scale * scale).toInt().coerceIn(
+            BookParser.MIN_CHARS_PER_PAGE,
+            BookParser.MAX_CHARS_PER_PAGE
+        )
+    }
+
+    private suspend fun persistTotalPagesIfNeeded(book: Book, pageCount: Int) {
+        if (pageCount > 0 && book.totalPages != pageCount) {
+            repository.updateTotalPages(book.id, pageCount)
         }
     }
 
@@ -269,6 +296,7 @@ class VaultViewModel(
         _readerPages.value = emptyList()
         _readerPageCount.value = 0
         _pdfBitmaps.value = emptyMap()
+        currentBookRawText = null
     }
 
     fun nextPage() {
@@ -310,8 +338,7 @@ class VaultViewModel(
 
     private fun prefetchPdfIfNecessary(pageIndex: Int) {
         val book = _currentBook.value ?: return
-        val ext = book.filePath.substringAfterLast(".").lowercase()
-        if (ext == "pdf") {
+        if (BookParser.isPdf(book.filePath)) {
             viewModelScope.launch(Dispatchers.IO) {
                 loadPdfBitmap(book.filePath, pageIndex)
                 // Warm up next page
@@ -324,163 +351,19 @@ class VaultViewModel(
 
     private fun loadPdfBitmap(filePath: String, pageIndex: Int) {
         if (_pdfBitmaps.value.containsKey(pageIndex)) return
-        val bitmap = renderPdfPage(filePath, pageIndex)
-        if (bitmap != null) {
-            _pdfBitmaps.value = _pdfBitmaps.value + (pageIndex to bitmap)
+        val bitmap = BookParser.renderPdfPage(filePath, pageIndex) ?: return
+        // Bounded LRU: keep only the pages nearest the current one so a long PDF
+        // can't accumulate unbounded bitmaps and exhaust memory.
+        val updated = LinkedHashMap(_pdfBitmaps.value)
+        updated[pageIndex] = bitmap
+        while (updated.size > MAX_CACHED_PDF_PAGES) {
+            val evict = updated.keys
+                .filter { it != pageIndex }
+                .maxByOrNull { kotlin.math.abs(it - _currentPageIndex.value) }
+                ?: break
+            updated.remove(evict)
         }
-    }
-
-    private fun getPdfPageCount(filePath: String): Int {
-        return try {
-            val file = File(filePath)
-            val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-            val renderer = PdfRenderer(pfd)
-            val count = renderer.pageCount
-            renderer.close()
-            pfd.close()
-            count
-        } catch (e: Exception) {
-            e.printStackTrace()
-            0
-        }
-    }
-
-    private fun renderPdfPage(filePath: String, pageIndex: Int): Bitmap? {
-        return try {
-            val file = File(filePath)
-            val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-            val renderer = PdfRenderer(pfd)
-            if (pageIndex < 0 || pageIndex >= renderer.pageCount) {
-                renderer.close()
-                pfd.close()
-                return null
-            }
-            val page = renderer.openPage(pageIndex)
-            // Scale up for crispy rendering
-            val width = (page.width * 1.8).toInt()
-            val height = (page.height * 1.8).toInt()
-            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-            page.close()
-            renderer.close()
-            pfd.close()
-            bitmap
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
-        }
-    }
-
-    private fun parseEpubText(filePath: String): List<String> {
-        val pages = mutableListOf<String>()
-        try {
-            val zipFile = ZipFile(filePath)
-            val entries = zipFile.entries()
-            val textEntries = mutableListOf<java.util.zip.ZipEntry>()
-            while (entries.hasMoreElements()) {
-                val entry = entries.nextElement()
-                val name = entry.name.lowercase()
-                if ((name.endsWith(".html") || name.endsWith(".xhtml") || name.endsWith(".txt")) && !name.contains("toc")) {
-                    textEntries.add(entry)
-                }
-            }
-            textEntries.sortBy { it.name }
-
-            for (entry in textEntries) {
-                zipFile.getInputStream(entry).use { stream ->
-                    val reader = BufferedReader(InputStreamReader(stream))
-                    val sb = java.lang.StringBuilder()
-                    var line: String?
-                    while (reader.readLine().also { line = it } != null) {
-                        sb.append(line).append("\n")
-                    }
-                    val rawText = sb.toString()
-                        .replace(Regex("<[^>]*>"), "") // Strip HTML tags
-                        .replace("&nbsp;", " ")
-                        .replace("&amp;", "&")
-                        .replace("&lt;", "<")
-                        .replace("&gt;", ">")
-                        .trim()
-
-                    if (rawText.isNotEmpty()) {
-                        var i = 0
-                        while (i < rawText.length) {
-                            val end = (i + 1400).coerceAtMost(rawText.length)
-                            pages.add(rawText.substring(i, end).trim())
-                            i += 1400
-                        }
-                    }
-                }
-            }
-            zipFile.close()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        if (pages.isEmpty()) {
-            pages.add("Empty or unparsable EPUB text. Ensure the EPUB file contains readable xhtml components.")
-        }
-        return pages
-    }
-
-    private fun parseMobiText(filePath: String): List<String> {
-        val pages = mutableListOf<String>()
-        try {
-            val file = File(filePath)
-            val bytes = FileInputStream(file).use { it.readBytes() }
-            val sb = StringBuilder()
-            var printableCount = 0
-            for (b in bytes) {
-                val c = b.toInt().toChar()
-                if (b in 32..126 || b == '\n'.code.toByte() || b == '\r'.code.toByte() || b == '\t'.code.toByte()) {
-                    sb.append(c)
-                    printableCount++
-                } else {
-                    if (printableCount > 20) {
-                        sb.append(" ")
-                    }
-                    printableCount = 0
-                }
-            }
-            val cleaned = sb.toString()
-                .replace(Regex("<[^>]*>"), "")
-                .replace(Regex("\\s+"), " ")
-                .trim()
-
-            if (cleaned.length > 100) {
-                var i = 0
-                while (i < cleaned.length) {
-                    val end = (i + 1400).coerceAtMost(cleaned.length)
-                    pages.add(cleaned.substring(i, end).trim())
-                    i += 1400
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        if (pages.isEmpty()) {
-            pages.add("Could not extract printable content from MOBI. The file might be encrypted.")
-        }
-        return pages
-    }
-
-    private fun parseTxtText(filePath: String): List<String> {
-        val pages = mutableListOf<String>()
-        try {
-            val file = File(filePath)
-            val text = file.readText(Charsets.UTF_8)
-            var i = 0
-            while (i < text.length) {
-                val end = (i + 1400).coerceAtMost(text.length)
-                pages.add(text.substring(i, end).trim())
-                i += 1400
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        if (pages.isEmpty()) {
-            pages.add("Empty text file.")
-        }
-        return pages
+        _pdfBitmaps.value = updated
     }
 
     fun addShelfToBook(bookId: Long, newShelf: String) {
@@ -513,8 +396,8 @@ class VaultViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             val allNotesList = notes.first()
             val bookNotes = allNotesList.filter { it.source == bookTitle }
-            val formattedTarget = targetTag.trim().lowercase().replace(" ", "_")
-            val formattedReplacement = replacementTag.trim().lowercase().replace(" ", "_")
+            val formattedTarget = AiEnrichmentService.normalizeTag(targetTag)
+            val formattedReplacement = AiEnrichmentService.normalizeTag(replacementTag)
 
             for (note in bookNotes) {
                 val updatedTags = note.tags.toMutableList()
@@ -611,70 +494,26 @@ class VaultViewModel(
             // 2. AI Enrichment if requested and key is available
             val activeKey = getActiveApiKey()
             if (triggerAi && activeKey.isNotEmpty() && content.isNotBlank()) {
-                val systemPrompt = """
-                    You are a professional knowledge analyst. Analyze the following note content and output a raw JSON response.
-                    
-                    Rules:
-                    1. If the User Title is empty or blank, generate a concise, professional title. If not empty, preserve it exactly.
-                    2. Generate 3 to 5 lowercase tags. Format: lowercase, alphanumeric, replace spaces with underscores (e.g. "philosophy_notes"). Include the book source name as a tag if applicable.
-                    3. Generate a highly descriptive ~10-sentence summary. It must detail the main arguments, context, and potential intellectual connections to other domains or notes.
-                    
-                    Output ONLY valid JSON matching this schema:
-                    {
-                      "title": "the note title",
-                      "tags": ["tag_one", "tag_two"],
-                      "summary": "10-sentence rich summary..."
+                when (val outcome = aiService.enrich(activeKey, title, content, source, userTags)) {
+                    is AiEnrichmentService.Outcome.Success -> {
+                        val enrichedNote = Note(
+                            id = activeNoteId,
+                            title = outcome.title,
+                            content = content,
+                            summary = outcome.summary,
+                            source = source,
+                            tags = outcome.mergedTags,
+                            origin = "ai" // Mark as AI origin once enriched
+                        )
+                        repository.insertNote(enrichedNote)
+                        _showAiConfirmation.value = true
+                        autoSuggestLinks(enrichedNote)
                     }
-                """.trimIndent()
-
-                val userPrompt = """
-                    User Title: $title
-                    Book Source: ${source ?: "None"}
-                    Note Content:
-                    $content
-                """.trimIndent()
-
-                val request = GenerateContentRequest(
-                    contents = listOf(Content(parts = listOf(Part(text = userPrompt)))),
-                    generationConfig = GenerationConfig(responseMimeType = "application/json", temperature = 0.2),
-                    systemInstruction = Content(parts = listOf(Part(text = systemPrompt)))
-                )
-
-                try {
-                    val response = GeminiClient.service.generateContent(activeKey, request)
-                    val rawText = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
-                    if (rawText != null) {
-                        val enrichment = GeminiClient.parseEnrichment(rawText)
-                        if (enrichment != null) {
-                            // Merge tags and apply
-                            val aiTags = enrichment.tags.map { it.trim().lowercase().replace(" ", "_") }
-                            val combinedTags = (userTags + aiTags).distinct().filter { it.isNotEmpty() }
-                            
-                            val enrichedNote = Note(
-                                id = activeNoteId,
-                                title = enrichment.title.ifBlank { title.ifBlank { "Untitled Note" } },
-                                content = content,
-                                summary = enrichment.summary,
-                                source = source,
-                                tags = combinedTags,
-                                origin = "ai" // Mark as AI origin if completely updated/enriched
-                            )
-                            repository.insertNote(enrichedNote)
-                            _showAiConfirmation.value = true
-                            
-                            // Auto-link creation logic
-                            autoSuggestLinks(enrichedNote)
-                        } else {
-                            _aiError.value = "Failed to parse AI output. AI output: $rawText"
-                        }
-                    } else {
-                        _aiError.value = "AI response was empty."
+                    is AiEnrichmentService.Outcome.Failure -> {
+                        _aiError.value = outcome.message
                     }
-                } catch (e: Exception) {
-                    _aiError.value = "AI Enrichment Failed: ${e.localizedMessage ?: e.message}"
-                } finally {
-                    _isAiLoading.value = false
                 }
+                _isAiLoading.value = false
             } else {
                 _isAiLoading.value = false
                 if (triggerAi && activeKey.isEmpty()) {
@@ -721,12 +560,11 @@ class VaultViewModel(
             var index = 0
             for (note in noteList) {
                 if (!positions.containsKey(note.id)) {
-                    // Lay out nodes in a beautiful Fermat Spiral to distribute them perfectly
-                    val theta = index * 2.39996f // Golden angle in radians
-                    val r = 120f * kotlin.math.sqrt(index.toFloat()) // Spacing factor (Optimized from 240f for compactness)
-                    val x = r * cos(theta)
-                    val y = r * sin(theta)
-                    positions[note.id] = Pair(x, y)
+                    // Prefer a persisted position; otherwise seed on the spiral.
+                    val persisted = if (note.posX != null && note.posY != null) {
+                        Pair(note.posX, note.posY)
+                    } else null
+                    positions[note.id] = persisted ?: MapLayoutEngine.seedPosition(index)
                 }
                 index++
             }
@@ -739,13 +577,47 @@ class VaultViewModel(
         _nodePositions.value = _nodePositions.value + (noteId to Pair(current.first + dx, current.second + dy))
     }
 
+    /** Persists a node's position after a drag ends, so the layout survives restarts. */
+    fun commitNodePosition(noteId: Long) {
+        val pos = _nodePositions.value[noteId] ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.updateNotePosition(noteId, pos.first, pos.second)
+        }
+    }
+
+    /**
+     * Runs a force-directed relaxation over the current node positions using the
+     * links as springs, then persists the settled layout. Linked notes pull
+     * together; unrelated ones spread apart.
+     */
+    fun autoArrangeMap() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val current = _nodePositions.value
+            if (current.size < 2) return@launch
+            val edges = links.first().map { it.noteIdA to it.noteIdB }
+            val relaxed = MapLayoutEngine.relax(current, edges)
+            _nodePositions.value = relaxed
+            relaxed.forEach { (id, p) -> repository.updateNotePosition(id, p.first, p.second) }
+        }
+    }
+
+    /** Resets pan/zoom to the default identity view. */
+    fun resetMapView() {
+        mapScale.value = 1f
+        mapOffsetX.value = 0f
+        mapOffsetY.value = 0f
+    }
+
     // --- Highlights Management ---
-    fun addHighlight(bookId: Long, pageIndex: Int, sentenceText: String, colorHex: String) {
+    // Keyed by sentenceIndex within the page so duplicate sentences and text
+    // reflow don't collide (sentenceText is still stored for display/quotes).
+    fun addHighlight(bookId: Long, pageIndex: Int, sentenceIndex: Int, sentenceText: String, colorHex: String) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.insertHighlight(
                 Highlight(
                     bookId = bookId,
                     pageIndex = pageIndex,
+                    sentenceIndex = sentenceIndex,
                     sentenceText = sentenceText.trim(),
                     colorHex = colorHex
                 )
@@ -753,9 +625,9 @@ class VaultViewModel(
         }
     }
 
-    fun removeHighlight(bookId: Long, pageIndex: Int, sentenceText: String) {
+    fun removeHighlight(bookId: Long, pageIndex: Int, sentenceIndex: Int) {
         viewModelScope.launch(Dispatchers.IO) {
-            repository.deleteSpecificHighlight(bookId, pageIndex, sentenceText.trim())
+            repository.deleteHighlightAtIndex(bookId, pageIndex, sentenceIndex)
         }
     }
 
