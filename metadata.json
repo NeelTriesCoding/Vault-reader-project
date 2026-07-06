@@ -1,0 +1,6 @@
+{
+  "name": "Vault",
+  "description": "A private, offline-first personal knowledge vault combining ebook reading, rich note-taking, and AI-powered tag generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
