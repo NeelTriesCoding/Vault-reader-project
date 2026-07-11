@@ -20,6 +20,7 @@ import com.example.data.Link
 import com.example.data.Note
 import com.example.data.Highlight
 import com.example.data.VaultRepository
+import com.example.ui.map.RadialLayoutEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -27,6 +28,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -35,8 +37,6 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.InputStreamReader
 import java.util.zip.ZipFile
-import kotlin.math.cos
-import kotlin.math.sin
 
 class VaultViewModel(
     application: Application,
@@ -137,13 +137,47 @@ class VaultViewModel(
     val mapOffsetX = MutableStateFlow(0f)
     val mapOffsetY = MutableStateFlow(0f)
 
-    // Map Filters
-    val mapTagFilter = MutableStateFlow<String?>(null)
-    val mapShelfFilter = MutableStateFlow<String?>(null)
+    // --- Radial Knowledge Map State ---
+    // null center = "default view" → engine resolves to the most recent note.
+    private val _centerNoteId = MutableStateFlow<Long?>(null)
+    val centerNoteId: StateFlow<Long?> = _centerNoteId.asStateFlow()
 
-    // Node Positions
-    private val _nodePositions = MutableStateFlow<Map<Long, Pair<Float, Float>>>(emptyMap())
-    val nodePositions: StateFlow<Map<Long, Pair<Float, Float>>> = _nodePositions.asStateFlow()
+    // Layout is pure math derived from (notes, links, center); computed off the
+    // main thread. Any shelf add/remove anywhere in the app flows through the
+    // notes stream, so wedges redistribute automatically.
+    val radialLayout: StateFlow<RadialLayoutEngine.RadialLayout> =
+        combine(notes, links, _centerNoteId) { noteList, linkList, centerId ->
+            RadialLayoutEngine.layout(noteList, linkList, centerId)
+        }
+            .flowOn(Dispatchers.Default)
+            .stateIn(
+                viewModelScope,
+                SharingStarted.WhileSubscribed(5000),
+                RadialLayoutEngine.RadialLayout.EMPTY
+            )
+
+    /** Tap a note → it becomes the new center; radii recompute around it. */
+    fun recenterOn(noteId: Long) {
+        _centerNoteId.value = noteId
+    }
+
+    /**
+     * Reset: back to the default center (most recent note). The screen animates
+     * the camera home itself — deliberately not snapped here, so the reset
+     * motion stays physical rather than a jump-cut.
+     */
+    fun resetRadialMap() {
+        _centerNoteId.value = null
+    }
+
+    // Wedge-tap pulse: (shelf, trigger). The timestamp lets the same shelf be
+    // re-pulsed on a second tap; the screen animates then ignores stale values.
+    private val _shelfPulse = MutableStateFlow<Pair<String, Long>?>(null)
+    val shelfPulse: StateFlow<Pair<String, Long>?> = _shelfPulse.asStateFlow()
+
+    fun pulseShelf(shelf: String) {
+        _shelfPulse.value = shelf to System.currentTimeMillis()
+    }
 
     // --- Connection Test State ---
     private val _testConnectionResult = MutableStateFlow<Pair<Boolean, String>?>(null)
@@ -596,6 +630,14 @@ class VaultViewModel(
             _isAiLoading.value = true
             _aiError.value = null
 
+            // The wedge anchor is fixed at creation: first user tag, else "unsorted".
+            // On edit, preserve the existing anchor (and short summary) — REPLACE
+            // inserts would otherwise silently reset them.
+            val existing = if (id != 0L) repository.getNoteById(id) else null
+            val creationShelf = existing?.creationShelf
+                ?: userTags.firstOrNull()?.trim()?.lowercase()?.replace(" ", "_")?.ifEmpty { null }
+                ?: "unsorted"
+
             // 1. Initial Insert to get a valid ID (or update)
             val rawNote = Note(
                 id = id,
@@ -603,7 +645,9 @@ class VaultViewModel(
                 content = content,
                 source = source,
                 origin = origin,
-                tags = userTags
+                tags = userTags,
+                creationShelf = creationShelf,
+                shortSummary = existing?.shortSummary
             )
             val noteId = repository.insertNote(rawNote)
             val activeNoteId = if (id == 0L) noteId else id
@@ -618,12 +662,14 @@ class VaultViewModel(
                     1. If the User Title is empty or blank, generate a concise, professional title. If not empty, preserve it exactly.
                     2. Generate 3 to 5 lowercase tags. Format: lowercase, alphanumeric, replace spaces with underscores (e.g. "philosophy_notes"). Include the book source name as a tag if applicable.
                     3. Generate a highly descriptive ~10-sentence summary. It must detail the main arguments, context, and potential intellectual connections to other domains or notes.
-                    
+                    4. Generate a short_summary of AT MOST 20 words capturing the note's single core idea. Plain prose, no markdown.
+
                     Output ONLY valid JSON matching this schema:
                     {
                       "title": "the note title",
                       "tags": ["tag_one", "tag_two"],
-                      "summary": "10-sentence rich summary..."
+                      "summary": "10-sentence rich summary...",
+                      "short_summary": "one core idea in at most twenty words"
                     }
                 """.trimIndent()
 
@@ -657,7 +703,9 @@ class VaultViewModel(
                                 summary = enrichment.summary,
                                 source = source,
                                 tags = combinedTags,
-                                origin = "ai" // Mark as AI origin if completely updated/enriched
+                                origin = "ai", // Mark as AI origin if completely updated/enriched
+                                creationShelf = creationShelf,
+                                shortSummary = enrichment.shortSummary ?: existing?.shortSummary
                             )
                             repository.insertNote(enrichedNote)
                             _showAiConfirmation.value = true
@@ -709,34 +757,6 @@ class VaultViewModel(
                 }
             }
         }
-    }
-
-    // --- Node Map Position Initializer ---
-    fun updateMapPositions() {
-        viewModelScope.launch {
-            val noteList = notes.first()
-            if (noteList.isEmpty()) return@launch
-
-            val positions = _nodePositions.value.toMutableMap()
-            var index = 0
-            for (note in noteList) {
-                if (!positions.containsKey(note.id)) {
-                    // Lay out nodes in a beautiful Fermat Spiral to distribute them perfectly
-                    val theta = index * 2.39996f // Golden angle in radians
-                    val r = 120f * kotlin.math.sqrt(index.toFloat()) // Spacing factor (Optimized from 240f for compactness)
-                    val x = r * cos(theta)
-                    val y = r * sin(theta)
-                    positions[note.id] = Pair(x, y)
-                }
-                index++
-            }
-            _nodePositions.value = positions
-        }
-    }
-
-    fun moveNode(noteId: Long, dx: Float, dy: Float) {
-        val current = _nodePositions.value[noteId] ?: Pair(0f, 0f)
-        _nodePositions.value = _nodePositions.value + (noteId to Pair(current.first + dx, current.second + dy))
     }
 
     // --- Highlights Management ---
@@ -846,7 +866,8 @@ class VaultViewModel(
                         createdAt = System.currentTimeMillis() - 86400000 * 2, // 2 days ago
                         tags = listOf("stoicism", "empathy", "morning_routine"),
                         source = "Meditations - Marcus Aurelius, Page 1",
-                        origin = "user"
+                        origin = "user",
+                        creationShelf = "stoicism"
                     )
                 )
 
@@ -858,7 +879,8 @@ class VaultViewModel(
                         createdAt = System.currentTimeMillis() - 86400000 * 1, // 1 day ago
                         tags = listOf("nietzsche", "existentialism", "psychology"),
                         source = "Beyond Good and Evil - Nietzsche, Page 1",
-                        origin = "user"
+                        origin = "user",
+                        creationShelf = "nietzsche"
                     )
                 )
 
@@ -870,7 +892,8 @@ class VaultViewModel(
                         createdAt = System.currentTimeMillis() - 3600000 * 4, // 4 hours ago
                         tags = listOf("plato", "epistemology", "enlightenment"),
                         source = "The Republic - Plato, Page 1",
-                        origin = "user"
+                        origin = "user",
+                        creationShelf = "plato"
                     )
                 )
 
@@ -882,7 +905,8 @@ class VaultViewModel(
                         createdAt = System.currentTimeMillis(), // now
                         tags = listOf("comparative_philosophy", "ethics", "virtue"),
                         source = "Gemini Synthesis",
-                        origin = "ai"
+                        origin = "ai",
+                        creationShelf = "comparative_philosophy"
                     )
                 )
 
@@ -923,7 +947,8 @@ class VaultViewModel(
                         createdAt = System.currentTimeMillis() - 86400000 * 3,
                         tags = listOf("stoicism", "amor_fati", "resilience"),
                         source = "Meditations - Marcus Aurelius, Book IV",
-                        origin = "atomic"
+                        origin = "atomic",
+                        creationShelf = "stoicism"
                     )
                 )
 
@@ -935,7 +960,8 @@ class VaultViewModel(
                         createdAt = System.currentTimeMillis() - 86400000 * 3,
                         tags = listOf("stoicism", "inner_citadel", "control"),
                         source = "Meditations - Marcus Aurelius, Book VIII",
-                        origin = "atomic"
+                        origin = "atomic",
+                        creationShelf = "stoicism"
                     )
                 )
 
@@ -947,7 +973,8 @@ class VaultViewModel(
                         createdAt = System.currentTimeMillis() - 86400000 * 3,
                         tags = listOf("stoicism", "dichotomy_of_control", "agency"),
                         source = "Meditations - Marcus Aurelius, Book XII",
-                        origin = "atomic"
+                        origin = "atomic",
+                        creationShelf = "stoicism"
                     )
                 )
 
@@ -987,9 +1014,6 @@ class VaultViewModel(
                         reasoning = "Compares Nietzsche's concept of Amor Fati with Marcus Aurelius' Stoic duty in the broader ethics map."
                     )
                 )
-
-                // Initialize positions for these newly seeded nodes
-                updateMapPositions()
 
             } catch (e: Exception) {
                 Log.e("VaultViewModel", "Error seeding sample data", e)
