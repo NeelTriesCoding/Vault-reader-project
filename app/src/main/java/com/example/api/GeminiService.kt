@@ -49,10 +49,7 @@ data class GenerateContentResponse(
 data class AiEnrichment(
     @Json(name = "title") val title: String,
     @Json(name = "tags") val tags: List<String>,
-    @Json(name = "summary") val summary: String,
-    // ~20-word one-liner for the radial map's long-press card. Nullable so
-    // responses from the older prompt (without rule 4) still parse.
-    @Json(name = "short_summary") val shortSummary: String? = null
+    @Json(name = "summary") val summary: String
 )
 
 interface GeminiApiService {
