@@ -11,8 +11,6 @@ import androidx.room.Query
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverter
 import androidx.room.TypeConverters
-import androidx.room.migration.Migration
-import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "notes")
@@ -24,13 +22,7 @@ data class Note(
     val createdAt: Long = System.currentTimeMillis(),
     val tags: List<String> = emptyList(),
     val source: String? = null, // e.g., "Philosophy Book, Page 42"
-    val origin: String = "user", // "user", "ai", or "atomic"
-    // The shelf (first tag) at creation time — the note's permanent wedge anchor
-    // on the radial map. Set once at creation; never changed by tag edits.
-    val creationShelf: String = "unsorted",
-    // Precomputed ~20-word summary for the map's long-press card. Null for notes
-    // enriched before this field existed; UI falls back to truncating [summary].
-    val shortSummary: String? = null
+    val origin: String = "user" // "user" or "ai"
 )
 
 @Entity(tableName = "books")
@@ -149,34 +141,11 @@ interface HighlightDao {
     suspend fun deleteHighlightById(id: Long)
 }
 
-@Database(entities = [Note::class, Book::class, Link::class, Highlight::class], version = 3, exportSchema = false)
+@Database(entities = [Note::class, Book::class, Link::class, Highlight::class], version = 2, exportSchema = false)
 @TypeConverters(Converters::class)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun noteDao(): NoteDao
     abstract fun bookDao(): BookDao
     abstract fun linkDao(): LinkDao
     abstract fun highlightDao(): HighlightDao
-
-    companion object {
-        /**
-         * v2 → v3: radial-map columns on notes. Additive, no data loss.
-         * creationShelf is backfilled from the note's first tag (tags are stored
-         * as a comma-joined string by [Converters]); untagged notes → "unsorted".
-         */
-        val MIGRATION_2_3 = object : Migration(2, 3) {
-            override fun migrate(db: SupportSQLiteDatabase) {
-                db.execSQL("ALTER TABLE notes ADD COLUMN creationShelf TEXT NOT NULL DEFAULT 'unsorted'")
-                db.execSQL("ALTER TABLE notes ADD COLUMN shortSummary TEXT")
-                db.execSQL(
-                    """
-                    UPDATE notes SET creationShelf = CASE
-                        WHEN tags IS NULL OR trim(tags) = '' THEN 'unsorted'
-                        WHEN instr(tags, ',') > 0 THEN trim(substr(tags, 1, instr(tags, ',') - 1))
-                        ELSE trim(tags)
-                    END
-                    """.trimIndent()
-                )
-            }
-        }
-    }
 }
