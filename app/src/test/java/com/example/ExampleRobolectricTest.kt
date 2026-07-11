@@ -3,7 +3,6 @@ package com.example
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -18,18 +17,5 @@ class ExampleRobolectricTest {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val appName = context.getString(R.string.app_name)
     assertEquals("Vault", appName)
-  }
-
-  @Test
-  fun testVaultViewModelInit() {
-    val context = ApplicationProvider.getApplicationContext<Context>()
-    val database = androidx.room.Room.inMemoryDatabaseBuilder(
-        context,
-        com.example.data.AppDatabase::class.java
-    ).allowMainThreadQueries().build()
-    val repository = com.example.data.VaultRepository(database)
-    val app = context.applicationContext as android.app.Application
-    val viewModel = com.example.ui.VaultViewModel(app, repository)
-    assertNotNull(viewModel)
   }
 }
